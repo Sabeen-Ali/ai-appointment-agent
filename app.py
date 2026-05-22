@@ -15,12 +15,15 @@ from reportlab.lib import colors
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # Load .env
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Initialize LLM
 llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile")
 
 # ── SQLite Database ──────────────────────────────────────────
@@ -77,6 +80,60 @@ def get_total_count():
 
 init_db()
 
+# ── RAG System ───────────────────────────────────────────────
+VECTOR_STORE_PATH = "vector_store"
+
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+def load_documents(uploaded_files):
+    docs = []
+    for uploaded_file in uploaded_files:
+        file_extension = uploaded_file.name.split(".")[-1].lower()
+        temp_path = f"temp_{uploaded_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        try:
+            if file_extension == "pdf":
+                loader = PyPDFLoader(temp_path)
+            else:
+                loader = TextLoader(temp_path)
+            docs.extend(loader.load())
+        finally:
+            os.remove(temp_path)
+    return docs
+
+def create_vector_store(docs):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50
+    )
+    chunks = text_splitter.split_documents(docs)
+    embeddings = get_embeddings()
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    vector_store.save_local(VECTOR_STORE_PATH)
+    return vector_store
+
+def load_vector_store():
+    if os.path.exists(VECTOR_STORE_PATH):
+        embeddings = get_embeddings()
+        return FAISS.load_local(
+            VECTOR_STORE_PATH,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+    return None
+
+def search_documents(query, k=3):
+    vector_store = load_vector_store()
+    if vector_store:
+        docs = vector_store.similarity_search(query, k=k)
+        return "\n".join([doc.page_content for doc in docs])
+    return ""
+
 # ── PDF Export ───────────────────────────────────────────────
 def generate_pdf(appointments):
     buffer = io.BytesIO()
@@ -110,6 +167,7 @@ class AgentState(TypedDict):
     intent: str
     appointment_confirmed: bool
     response: str
+    rag_context: str
 
 def detect_intent(state: AgentState) -> AgentState:
     user_input = state["user_input"].lower()
@@ -121,21 +179,40 @@ def detect_intent(state: AgentState) -> AgentState:
         intent = "view"
     elif any(word in user_input for word in ["reschedule", "change", "move"]):
         intent = "reschedule"
+    elif any(word in user_input for word in ["doctor", "available", "service", "hours", "cost", "price", "specialist"]):
+        intent = "rag_query"
     else:
         intent = "general"
     return {**state, "intent": intent}
 
+def retrieve_context(state: AgentState) -> AgentState:
+    if state["intent"] == "rag_query":
+        context = search_documents(state["user_input"])
+        return {**state, "rag_context": context}
+    return {**state, "rag_context": ""}
+
 def generate_response(state: AgentState) -> AgentState:
-    system_prompt = """You are a helpful AI appointment booking assistant.
-    When an appointment is fully confirmed with all details (type, date, time),
-    start your response with 'APPOINTMENT CONFIRMED:'.
-    Be conversational, helpful and concise."""
+    rag_context = state.get("rag_context", "")
+    if rag_context:
+        system_prompt = f"""You are a helpful AI appointment booking assistant.
+        Use the following information from our documents to answer the user's question:
+        
+        {rag_context}
+        
+        If the information is not in the documents, say so politely.
+        When an appointment is confirmed, start with 'APPOINTMENT CONFIRMED:'."""
+    else:
+        system_prompt = """You are a helpful AI appointment booking assistant.
+        Help users schedule, reschedule, or cancel appointments.
+        When confirmed, start with 'APPOINTMENT CONFIRMED:'."""
+
     messages = [SystemMessage(content=system_prompt)]
     for msg in state["messages"]:
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
         else:
             messages.append(AIMessage(content=msg["content"]))
+
     response = llm.invoke(messages)
     reply = response.content
     confirmed = "APPOINTMENT CONFIRMED" in reply.upper()
@@ -149,10 +226,12 @@ def save_if_confirmed(state: AgentState) -> AgentState:
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("detect_intent", detect_intent)
+    graph.add_node("retrieve_context", retrieve_context)
     graph.add_node("generate_response", generate_response)
     graph.add_node("save_if_confirmed", save_if_confirmed)
     graph.set_entry_point("detect_intent")
-    graph.add_edge("detect_intent", "generate_response")
+    graph.add_edge("detect_intent", "retrieve_context")
+    graph.add_edge("retrieve_context", "generate_response")
     graph.add_edge("generate_response", "save_if_confirmed")
     graph.add_edge("save_if_confirmed", END)
     return graph.compile()
@@ -171,33 +250,6 @@ st.markdown("""
     }
     [data-testid="stSidebar"] * { color: #e9d5ff !important; }
     .stApp, .stMarkdown, p, h1, h2, h3 { color: #e9d5ff; }
-    .user-message {
-        display: flex;
-        justify-content: flex-end;
-        margin: 8px 0;
-    }
-    .user-bubble {
-        background: linear-gradient(135deg, #7C3AED, #9333ea);
-        color: white;
-        padding: 12px 16px;
-        border-radius: 18px 18px 4px 18px;
-        max-width: 70%;
-        box-shadow: 0 4px 15px rgba(124,58,237,0.4);
-    }
-    .ai-message {
-        display: flex;
-        justify-content: flex-start;
-        margin: 8px 0;
-    }
-    .ai-bubble {
-        background: linear-gradient(135deg, #2d1b69, #3b1f7a);
-        color: #e9d5ff;
-        padding: 12px 16px;
-        border-radius: 18px 18px 18px 4px;
-        max-width: 70%;
-        border: 1px solid #7C3AED;
-        box-shadow: 0 4px 15px rgba(124,58,237,0.2);
-    }
     .intent-badge {
         background: rgba(124,58,237,0.3);
         color: #c4b5fd;
@@ -206,6 +258,15 @@ st.markdown("""
         font-size: 12px;
         font-weight: bold;
         border: 1px solid #7C3AED;
+    }
+    .rag-badge {
+        background: rgba(16,185,129,0.3);
+        color: #6ee7b7;
+        padding: 3px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: bold;
+        border: 1px solid #10b981;
     }
     .stat-box {
         background: linear-gradient(135deg, #2d1b69, #3b1f7a);
@@ -248,6 +309,33 @@ st.markdown("""
         border: 2px solid #7C3AED !important;
         border-radius: 25px !important;
     }
+    .user-bubble {
+        display: flex;
+        justify-content: flex-end;
+        margin: 8px 0;
+    }
+    .user-bubble-inner {
+        background: linear-gradient(135deg, #7C3AED, #9333ea);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 18px 18px 4px 18px;
+        max-width: 70%;
+        box-shadow: 0 4px 15px rgba(124,58,237,0.4);
+    }
+    .ai-bubble {
+        display: flex;
+        justify-content: flex-start;
+        margin: 8px 0;
+    }
+    .ai-bubble-inner {
+        background: linear-gradient(135deg, #2d1b69, #3b1f7a);
+        color: #e9d5ff;
+        padding: 12px 16px;
+        border-radius: 18px 18px 18px 4px;
+        max-width: 70%;
+        border: 1px solid #7C3AED;
+        box-shadow: 0 4px 15px rgba(124,58,237,0.2);
+    }
     @media (max-width: 768px) {
         .main .block-container { padding: 1rem; }
         h1 { font-size: 1.5rem !important; }
@@ -259,9 +347,9 @@ st.markdown("""
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/000000/calendar--v1.png", width=80)
     st.title("📅 Appointment Agent")
-    st.caption("Powered by LangChain + LangGraph")
+    st.caption("Powered by LangChain + LangGraph + RAG")
     st.markdown("---")
-    page = st.radio("Navigate", ["💬 Book Appointment", "📋 My Appointments"])
+    page = st.radio("Navigate", ["💬 Book Appointment", "📚 Knowledge Base", "📋 My Appointments"])
     st.markdown("---")
     total = get_total_count()
     st.markdown("### 📊 Stats")
@@ -272,35 +360,38 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.markdown("---")
+    rag_status = "✅ Active" if os.path.exists(VECTOR_STORE_PATH) else "❌ No Documents"
+    st.markdown(f"### 📚 RAG Status\n**{rag_status}**")
+    st.markdown("---")
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         st.rerun()
 
-# Book Appointment Page
+# ── Book Appointment Page ────────────────────────────────────
 if page == "💬 Book Appointment":
     st.title("💬 Book an Appointment")
-    st.markdown("*Powered by **LangChain + LangGraph** AI Agent*")
+    st.markdown("*Powered by **LangChain + LangGraph + RAG** AI Agent*")
     st.markdown("---")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display messages left/right
     for msg in st.session_state.messages:
         if msg["role"] == "user":
             st.markdown(f"""
-            <div class='user-message'>
-                <div class='user-bubble'>
+            <div class='user-bubble'>
+                <div class='user-bubble-inner'>
                     <b>👤 You</b><br>{msg["content"]}
                 </div>
             </div>
             """, unsafe_allow_html=True)
         else:
             intent_html = f"<br><span class='intent-badge'>🎯 Intent: {msg['intent']}</span>" if msg.get("intent") else ""
+            rag_html = "<br><span class='rag-badge'>📚 RAG Enhanced</span>" if msg.get("rag_used") else ""
             st.markdown(f"""
-            <div class='ai-message'>
-                <div class='ai-bubble'>
-                    <b style='color:#a855f7'>🤖 AI Agent</b><br>{msg["content"]}{intent_html}
+            <div class='ai-bubble'>
+                <div class='ai-bubble-inner'>
+                    <b style='color:#a855f7'>🤖 AI Agent</b><br>{msg["content"]}{intent_html}{rag_html}
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -308,16 +399,14 @@ if page == "💬 Book Appointment":
     user_input = st.chat_input("Type your appointment request...")
 
     if user_input:
-        # Show user message on right
+        st.session_state.messages.append({"role": "user", "content": user_input})
         st.markdown(f"""
-        <div class='user-message'>
-            <div class='user-bubble'>
+        <div class='user-bubble'>
+            <div class='user-bubble-inner'>
                 <b>👤 You</b><br>{user_input}
             </div>
         </div>
         """, unsafe_allow_html=True)
-
-        st.session_state.messages.append({"role": "user", "content": user_input})
 
         with st.spinner("🤖 Agent thinking..."):
             result = agent.invoke({
@@ -325,17 +414,19 @@ if page == "💬 Book Appointment":
                 "user_input": user_input,
                 "intent": "",
                 "appointment_confirmed": False,
-                "response": ""
+                "response": "",
+                "rag_context": ""
             })
             reply = result["response"]
             intent = result["intent"]
+            rag_used = bool(result.get("rag_context"))
 
-        # Show AI message on left
+        rag_html = "<br><span class='rag-badge'>📚 RAG Enhanced</span>" if rag_used else ""
         st.markdown(f"""
-        <div class='ai-message'>
-            <div class='ai-bubble'>
+        <div class='ai-bubble'>
+            <div class='ai-bubble-inner'>
                 <b style='color:#a855f7'>🤖 AI Agent</b><br>{reply}
-                <br><span class='intent-badge'>🎯 Intent: {intent}</span>
+                <br><span class='intent-badge'>🎯 Intent: {intent}</span>{rag_html}
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -343,14 +434,70 @@ if page == "💬 Book Appointment":
         st.session_state.messages.append({
             "role": "assistant",
             "content": reply,
-            "intent": intent
+            "intent": intent,
+            "rag_used": rag_used
         })
 
         if result["appointment_confirmed"]:
             st.success("✅ Appointment saved to database!")
             st.balloons()
 
-# My Appointments Page
+# ── Knowledge Base Page ──────────────────────────────────────
+elif page == "📚 Knowledge Base":
+    st.title("📚 Knowledge Base")
+    st.markdown("*Upload documents to make AI smarter about your services*")
+    st.markdown("---")
+
+    st.subheader("📤 Upload Documents")
+    st.markdown("Upload PDF or TXT files about your clinic, doctors, services, or schedules")
+
+    uploaded_files = st.file_uploader(
+        "Choose files",
+        type=["pdf", "txt"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files:
+        if st.button("🔄 Process Documents"):
+            with st.spinner("Processing documents..."):
+                docs = load_documents(uploaded_files)
+                create_vector_store(docs)
+            st.success(f"✅ Successfully processed {len(uploaded_files)} document(s)!")
+            st.info(f"📊 Total chunks created from documents ready for search!")
+
+    st.markdown("---")
+    st.subheader("📝 Or Add Text Directly")
+    manual_text = st.text_area(
+        "Type information about your clinic/services:",
+        placeholder="Example: Dr. Ahmed is available Monday to Friday from 9am to 5pm. He specializes in general medicine...",
+        height=150
+    )
+
+    if st.button("💾 Save to Knowledge Base"):
+        if manual_text:
+            temp_path = "temp_manual.txt"
+            with open(temp_path, "w") as f:
+                f.write(manual_text)
+            loader = TextLoader(temp_path)
+            docs = loader.load()
+            os.remove(temp_path)
+            create_vector_store(docs)
+            st.success("✅ Information saved to knowledge base!")
+        else:
+            st.warning("Please enter some text first!")
+
+    st.markdown("---")
+    if os.path.exists(VECTOR_STORE_PATH):
+        st.success("✅ Knowledge base is active — AI will use it to answer questions!")
+        if st.button("🗑️ Clear Knowledge Base"):
+            import shutil
+            shutil.rmtree(VECTOR_STORE_PATH)
+            st.success("Knowledge base cleared!")
+            st.rerun()
+    else:
+        st.warning("⚠️ No knowledge base yet — upload documents to get started!")
+
+# ── My Appointments Page ─────────────────────────────────────
 elif page == "📋 My Appointments":
     st.title("📋 My Appointments")
     st.markdown("---")
