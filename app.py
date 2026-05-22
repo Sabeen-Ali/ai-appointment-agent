@@ -1,9 +1,9 @@
 ﻿import streamlit as st
-import json
 import os
 import sqlite3
 import io
 import bcrypt
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated
@@ -49,6 +49,7 @@ def init_db():
             request TEXT,
             response TEXT,
             timestamp TEXT,
+            appointment_date TEXT,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
@@ -91,19 +92,53 @@ def load_appointments(user_id, search_query=""):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     if search_query:
-        c.execute("SELECT * FROM appointments WHERE user_id = ? AND (request LIKE ? OR response LIKE ?)",
+        c.execute("""SELECT id, user_id, request, response, timestamp, appointment_date 
+                     FROM appointments WHERE user_id = ? AND (request LIKE ? OR response LIKE ?)""",
                  (user_id, f"%{search_query}%", f"%{search_query}%"))
     else:
-        c.execute("SELECT * FROM appointments WHERE user_id = ? ORDER BY id DESC", (user_id,))
+        c.execute("""SELECT id, user_id, request, response, timestamp, appointment_date 
+                     FROM appointments WHERE user_id = ? ORDER BY id DESC""", (user_id,))
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "user_id": r[1], "request": r[2], "response": r[3], "timestamp": r[4]} for r in rows]
+    return [{"id": r[0], "user_id": r[1], "request": r[2], "response": r[3],
+             "timestamp": r[4], "appointment_date": r[5]} for r in rows]
+
+def extract_appointment_date(text):
+    months = {"january":"01","february":"02","march":"03","april":"04","may":"05","june":"06",
+              "july":"07","august":"08","september":"09","october":"10","november":"11","december":"12"}
+    current_year = datetime.now().year
+
+    # Pattern 1: YYYY-MM-DD
+    match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+    if match:
+        return match.group(1)
+
+    # Pattern 2: Month DD, YYYY or Month DD YYYY
+    match = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s*(\d{4})?\b', text, re.IGNORECASE)
+    if match:
+        month = months[match.group(1).lower()]
+        day = match.group(2).zfill(2)
+        year = match.group(3) if match.group(3) else str(current_year)
+        return f"{year}-{month}-{day}"
+
+    # Pattern 3: DD Month YYYY
+    match = re.search(r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s*(\d{4})?\b', text, re.IGNORECASE)
+    if match:
+        day = match.group(1).zfill(2)
+        month = months[match.group(2).lower()]
+        year = match.group(3) if match.group(3) else str(current_year)
+        return f"{year}-{month}-{day}"
+
+    return datetime.now().strftime("%Y-%m-%d")
 
 def save_appointment(user_id, user_message, ai_response):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT INTO appointments (user_id, request, response, timestamp) VALUES (?, ?, ?, ?)",
-             (user_id, user_message, ai_response, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    appointment_date = extract_appointment_date(ai_response)
+    c.execute("""INSERT INTO appointments (user_id, request, response, timestamp, appointment_date) 
+                 VALUES (?, ?, ?, ?, ?)""",
+             (user_id, user_message, ai_response,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S"), appointment_date))
     conn.commit()
     conn.close()
 
@@ -123,6 +158,20 @@ def get_total_count(user_id):
     return count
 
 init_db()
+
+# ── Migrate old DB ───────────────────────────────────────────
+def migrate_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE appointments ADD COLUMN appointment_date TEXT")
+        c.execute("UPDATE appointments SET appointment_date = timestamp WHERE appointment_date IS NULL")
+        conn.commit()
+    except:
+        pass
+    conn.close()
+
+migrate_db()
 
 # ── RAG System ───────────────────────────────────────────────
 VECTOR_STORE_PATH = "vector_store"
@@ -177,10 +226,11 @@ def generate_pdf(appointments):
     elements.append(Paragraph("AI Appointment Booking Agent", styles["Title"]))
     elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
     elements.append(Spacer(1, 20))
-    data = [["#", "Date Booked", "Request"]]
+    data = [["#", "Booked On", "Appointment Date", "Request"]]
     for apt in appointments:
-        data.append([str(apt["id"]), apt["timestamp"], apt["request"][:60]])
-    table = Table(data, colWidths=[40, 150, 300])
+        data.append([str(apt["id"]), apt["timestamp"][:10],
+                    apt.get("appointment_date", "")[:10], apt["request"][:40]])
+    table = Table(data, colWidths=[30, 100, 100, 260])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7C3AED")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -310,15 +360,6 @@ st.markdown("""
         margin: 8px 0;
         box-shadow: 0 4px 15px rgba(124,58,237,0.3);
         color: #e9d5ff;
-    }
-    .auth-box {
-        background: linear-gradient(135deg, #2d1b69, #3b1f7a);
-        border-radius: 16px;
-        padding: 30px;
-        border: 1px solid #7C3AED;
-        box-shadow: 0 8px 30px rgba(124,58,237,0.3);
-        max-width: 400px;
-        margin: 0 auto;
     }
     .stButton > button {
         background: linear-gradient(135deg, #7C3AED, #9333ea) !important;
@@ -592,10 +633,11 @@ else:
             st.subheader("📅 Appointment Calendar")
             events = []
             for apt in appointments:
+                apt_date = apt.get("appointment_date") or apt["timestamp"][:10]
                 events.append({
                     "title": apt["request"][:30] + "...",
-                    "start": apt["timestamp"][:10],
-                    "end": apt["timestamp"][:10],
+                    "start": apt_date[:10],
+                    "end": apt_date[:10],
                     "backgroundColor": "#7C3AED",
                     "borderColor": "#9333ea",
                 })
@@ -645,7 +687,9 @@ else:
 
                 st.markdown("---")
                 st.subheader("📊 Overview")
-                table_data = [{"#": a["id"], "Date Booked": a["timestamp"], "Request": a["request"]} for a in appointments]
+                table_data = [{"#": a["id"], "Booked On": a["timestamp"][:10],
+                               "Appointment Date": a.get("appointment_date", "")[:10],
+                               "Request": a["request"]} for a in appointments]
                 st.table(table_data)
 
                 st.markdown("---")
@@ -655,7 +699,9 @@ else:
                     with col1:
                         st.markdown(f"""
                         <div class='appointment-card'>
-                            <b style='color:#a855f7'>#{apt['id']} — {apt['timestamp']}</b><br>
+                            <b style='color:#a855f7'>#{apt['id']}</b>
+                            <b style='color:#c4b5fd'> | Booked: {apt['timestamp'][:10]}</b>
+                            <b style='color:#6ee7b7'> | Appointment: {apt.get('appointment_date', '')[:10]}</b><br>
                             <b style='color:#c4b5fd'>Request:</b>
                             <span style='color:#e9d5ff'>{apt['request']}</span><br>
                             <b style='color:#c4b5fd'>AI Response:</b>
